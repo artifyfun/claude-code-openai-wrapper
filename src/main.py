@@ -124,7 +124,9 @@ def prompt_for_api_protection() -> Optional[str]:
 
 # Initialize Claude CLI
 claude_cli = ClaudeCodeCLI(
-    timeout=int(os.getenv("MAX_TIMEOUT", "600000")), cwd=os.getenv("CLAUDE_CWD")
+    timeout=int(os.getenv("MAX_TIMEOUT", "600000")), 
+    cwd=os.getenv("CLAUDE_CWD"),
+    cli_path=os.getenv("CLAUDE_CLI_PATH")
 )
 
 
@@ -1598,6 +1600,113 @@ async def debug_request_validation(request: Request):
             }
         }
 
+
+@app.get("/v1/debug/claude-cli")
+@rate_limit_endpoint("debug")
+async def debug_claude_cli(request: Request):
+    """Diagnostic endpoint to inspect the Claude CLI environment from the server's perspective.
+
+    Reports the CLI path, version, working directory, environment variables,
+    and ~/.claude/settings.json contents to help diagnose connection issues.
+    """
+    import subprocess
+    import shutil
+    from pathlib import Path
+
+    result = {
+        "cli_path_configured": claude_cli.cli_path,
+        "cli_path_resolved": None,
+        "cli_version": None,
+        "cwd": str(claude_cli.cwd),
+        "auth_method": None,
+        "env_vars_passed_to_sdk": {},
+        "process_env": {},
+        "claude_settings": None,
+        "cli_test": None,
+        "errors": [],
+    }
+
+    # Auth method
+    from src.auth import auth_manager
+    result["auth_method"] = auth_manager.auth_method
+
+    # Resolve CLI path
+    cli_path = claude_cli.cli_path or "claude"
+    resolved = shutil.which(cli_path)
+    result["cli_path_resolved"] = resolved
+    if not resolved:
+        result["errors"].append(f"Cannot find '{cli_path}' in PATH. Server PATH: {os.environ.get('PATH', 'NOT SET')}")
+
+    # Get version
+    try:
+        proc = subprocess.run(
+            [cli_path, "--version"],
+            capture_output=True, text=True, timeout=10,
+            env=os.environ.copy(),
+        )
+        result["cli_version"] = proc.stdout.strip() if proc.returncode == 0 else f"exit code {proc.returncode}: {proc.stderr.strip()}"
+    except FileNotFoundError:
+        result["cli_version"] = f"ERROR: '{cli_path}' not found"
+        result["errors"].append(f"FileNotFoundError for '{cli_path}'")
+    except Exception as e:
+        result["cli_version"] = f"ERROR: {e}"
+
+    # Env vars that would be passed to SDK
+    result["env_vars_passed_to_sdk"] = {
+        k: v[:20] + "..." if len(v) > 20 else v
+        for k, v in claude_cli.claude_env_vars.items()
+    }
+
+    # Relevant process env vars (masked)
+    for key, value in sorted(os.environ.items()):
+        if key.startswith(("ANTHROPIC_", "CLAUDE_", "AWS_", "GOOGLE_")):
+            result["process_env"][key] = value[:20] + "..." if len(value) > 20 else value
+    result["process_env"]["PATH"] = os.environ.get("PATH", "NOT SET")
+
+    # Read ~/.claude/settings.json
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            import json as json_lib
+            with open(settings_path) as f:
+                settings = json_lib.load(f)
+            # Mask sensitive values in env section
+            if "env" in settings:
+                masked_env = {}
+                for k, v in settings["env"].items():
+                    masked_env[k] = v[:20] + "..." if len(str(v)) > 20 else v
+                settings["env"] = masked_env
+            result["claude_settings"] = settings
+        except Exception as e:
+            result["claude_settings"] = f"ERROR reading: {e}"
+    else:
+        result["claude_settings"] = "File not found"
+
+    # Quick CLI test (claude --print 'Hello')
+    try:
+        proc = subprocess.run(
+            [cli_path, "--print", "Hello"],
+            capture_output=True, text=True, timeout=30,
+            env=os.environ.copy(),
+        )
+        if proc.returncode == 0:
+            result["cli_test"] = {"status": "ok", "output": proc.stdout.strip()[:200]}
+        else:
+            result["cli_test"] = {
+                "status": "failed",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout.strip()[:500],
+                "stderr": proc.stderr.strip()[:500],
+            }
+            result["errors"].append(f"CLI test failed with exit code {proc.returncode}")
+    except FileNotFoundError:
+        result["cli_test"] = {"status": "error", "message": f"'{cli_path}' not found"}
+    except subprocess.TimeoutExpired:
+        result["cli_test"] = {"status": "timeout", "message": "CLI test timed out (30s)"}
+    except Exception as e:
+        result["cli_test"] = {"status": "error", "message": str(e)}
+
+    return result
 
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")

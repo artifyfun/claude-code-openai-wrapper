@@ -211,9 +211,27 @@ class ClaudeCodeAuthManager:
                 )
 
         elif self.auth_method == "claude_cli":
-            # For CLI auth, don't set any environment variables
-            # Let Claude Code SDK use the existing CLI authentication
-            pass
+            # For CLI auth, read env vars from ~/.claude/settings.json
+            # to ensure we use the cc-switch configured provider/model,
+            # NOT any IDE-injected env vars that might override settings.json.
+            settings_path = os.path.expanduser("~/.claude/settings.json")
+            if os.path.exists(settings_path):
+                try:
+                    import json
+                    with open(settings_path) as f:
+                        settings = json.load(f)
+                    settings_env = settings.get("env", {})
+                    if settings_env:
+                        for key, value in settings_env.items():
+                            env_vars[key] = str(value)
+                            logger.debug(f"From settings.json: {key}={str(value)[:20]}...")
+                        logger.info(f"Loaded {len(settings_env)} env vars from ~/.claude/settings.json")
+                    else:
+                        logger.debug("No env section in ~/.claude/settings.json")
+                except Exception as e:
+                    logger.warning(f"Failed to read ~/.claude/settings.json: {e}")
+            else:
+                logger.debug("~/.claude/settings.json not found")
 
         return env_vars
 

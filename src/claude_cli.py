@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class ClaudeCodeCLI:
-    def __init__(self, timeout: int = 600000, cwd: Optional[str] = None):
+    def __init__(self, timeout: int = 600000, cwd: Optional[str] = None, cli_path: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
         self.temp_dir = None
+        self.cli_path = cli_path
 
         # If cwd is provided (from CLAUDE_CWD env var), use it
         # Otherwise create an isolated temp directory
@@ -56,6 +57,13 @@ class ClaudeCodeCLI:
         try:
             # Test SDK with a simple query
             logger.info("Testing Claude Agent SDK...")
+            logger.info(f"  cli_path: {self.cli_path}")
+            logger.info(f"  cwd: {self.cwd}")
+            if self.claude_env_vars:
+                for key in self.claude_env_vars:
+                    logger.info(f"  env: {key}={self.claude_env_vars[key][:20]}...")
+            else:
+                logger.info("  env: (no extra env vars to pass)")
 
             messages = []
             async for message in query(
@@ -63,6 +71,7 @@ class ClaudeCodeCLI:
                 options=ClaudeAgentOptions(
                     max_turns=1,
                     cwd=self.cwd,
+                    cli_path=self.cli_path,
                     system_prompt={"type": "preset", "preset": "claude_code"},
                 ),
             ):
@@ -86,6 +95,7 @@ class ClaudeCodeCLI:
 
         except Exception as e:
             logger.error(f"Claude Agent SDK verification failed: {e}")
+            logger.error(f"  Error type: {type(e).__name__}")
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_API_KEY environment variable")
@@ -117,7 +127,7 @@ class ClaudeCodeCLI:
 
             try:
                 # Build SDK options
-                options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
+                options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd, cli_path=self.cli_path)
 
                 # Set model if specified
                 if model:
