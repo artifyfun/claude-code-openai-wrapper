@@ -463,47 +463,50 @@ async def generate_streaming_response(
         ):
             chunks_buffer.append(chunk)
 
-            # Check if we have an assistant message
-            # Handle both old format (type/message structure) and new format (direct content)
+            # Extract content and reasoning from chunk
             content = None
+            reasoning_content = None
             
-            # 🆕 Handle incremental text events (crucial for true streaming)
-            # The Claude CLI with --include-partial-messages nests everything under 'event'
+            # 🆕 Handle incremental events (crucial for true streaming)
             if chunk.get("type") == "stream_event" and "event" in chunk:
                 event = chunk["event"]
                 event_type = event.get("type")
                 
-                if event_type == "content_block_delta" and "delta" in chunk["event"]:
+                if event_type == "content_block_delta" and "delta" in event:
                     delta = event["delta"]
                     if isinstance(delta, dict):
+                        # Text delta
                         if delta.get("type") == "text_delta":
                             content = delta.get("text", "")
                         elif "text" in delta:
                             content = delta.get("text", "")
+                        # Reasoning/Thinking delta
+                        elif delta.get("type") == "thinking_delta":
+                            reasoning_content = delta.get("thinking", "")
+                        elif "thinking" in delta:
+                            reasoning_content = delta.get("thinking", "")
+                
                 elif event_type == "text" and "text" in event:
                     content = event["text"]
             
-            # Legacy/Alternative formats
-            elif chunk.get("type") == "text" and "text" in chunk:
-                content = chunk["text"]
-            elif chunk.get("type") == "delta" and "delta" in chunk:
-                content = chunk["delta"].get("text", "") if isinstance(chunk["delta"], dict) else ""
-            elif chunk.get("type") == "content_block_delta" and "delta" in chunk:
-                delta = chunk["delta"]
-                if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                    content = delta.get("text", "")
-                elif isinstance(delta, dict) and "text" in delta:
-                    content = delta.get("text", "")
-            
-            elif chunk.get("type") == "assistant" and "message" in chunk:
-                # Old format: {"type": "assistant", "message": {"content": [...]}}
-                message = chunk["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-            elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]} (converted AssistantMessage)
-                content = chunk["content"]
-            if content is not None:
+            # Ignore cumulative 'assistant' events during streaming to avoid duplication
+            # Only process fallback formats if no incremental content was found
+            if content is None and reasoning_content is None:
+                if chunk.get("type") == "text" and "text" in chunk:
+                    content = chunk["text"]
+                elif chunk.get("type") == "delta" and "delta" in chunk:
+                    content = chunk["delta"].get("text", "") if isinstance(chunk["delta"], dict) else ""
+                elif chunk.get("type") == "content_block_delta" and "delta" in chunk:
+                    # Generic delta outside of stream_event
+                    delta = chunk["delta"]
+                    if isinstance(delta, dict):
+                        if delta.get("type") == "text_delta":
+                            content = delta.get("text", "")
+                        elif delta.get("type") == "thinking_delta":
+                            reasoning_content = delta.get("thinking", "")
+
+            # Send data if we found content or reasoning
+            if content is not None or reasoning_content is not None:
                 # Send initial role chunk if we haven't already
                 if not role_sent:
                     initial_chunk = ChatCompletionStreamResponse(
@@ -520,55 +523,34 @@ async def generate_streaming_response(
                     yield f"data: {initial_chunk.model_dump_json()}\n\n"
                     role_sent = True
 
-                # Handle content blocks
-                if isinstance(content, list):
-                    for block in content:
-                        # Handle TextBlock objects from Claude Agent SDK
-                        if hasattr(block, "text"):
-                            raw_text = block.text
-                        # Handle dictionary format for backward compatibility
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            raw_text = block.get("text", "")
-                        else:
-                            continue
+                # Prepare delta dictionary
+                delta_payload = {}
+                
+                if reasoning_content is not None:
+                    # Pass through reasoning content (thinking)
+                    delta_payload["reasoning_content"] = reasoning_content
+                
+                if content is not None:
+                    # Filter text (with is_stream=True to avoid destructive stripping)
+                    filtered_text = MessageAdapter.filter_content(content, is_stream=True)
+                    if filtered_text:
+                        delta_payload["content"] = filtered_text
 
-                        # Filter out tool usage and thinking blocks
-                        filtered_text = MessageAdapter.filter_content(raw_text)
-
-                        if filtered_text and not filtered_text.isspace():
-                            # Create streaming chunk
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={"content": filtered_text},
-                                        finish_reason=None,
-                                    )
-                                ],
+                # Send chunk if payload is not empty
+                if delta_payload:
+                    stream_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=request.model,
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta=delta_payload,
+                                finish_reason=None,
                             )
-
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            content_sent = True
-
-                elif isinstance(content, str):
-                    # Filter out tool usage and thinking blocks
-                    filtered_content = MessageAdapter.filter_content(content)
-
-                    if filtered_content and not filtered_content.isspace():
-                        # Create streaming chunk
-                        stream_chunk = ChatCompletionStreamResponse(
-                            id=request_id,
-                            model=request.model,
-                            choices=[
-                                StreamChoice(
-                                    index=0, delta={"content": filtered_content}, finish_reason=None
-                                )
-                            ],
-                        )
-
-                        yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                        ],
+                    )
+                    yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                    if "content" in delta_payload:
                         content_sent = True
 
         # Handle case where no role was sent (send at least role chunk)
@@ -682,6 +664,7 @@ async def chat_completions(
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
                 },
             )
         else:
@@ -768,6 +751,12 @@ async def chat_completions(
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
             completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
+            # Extract reasoning/thinking content if present
+            reasoning_content = None
+            thinking_match = re.search(r"<thinking>(.*?)</thinking>", raw_assistant_content, re.DOTALL)
+            if thinking_match:
+                reasoning_content = thinking_match.group(1).strip()
+            
             # Create response
             response = ChatCompletionResponse(
                 id=request_id,
@@ -775,7 +764,11 @@ async def chat_completions(
                 choices=[
                     Choice(
                         index=0,
-                        message=Message(role="assistant", content=assistant_content),
+                        message=Message(
+                            role="assistant", 
+                            content=assistant_content,
+                            reasoning_content=reasoning_content
+                        ),
                         finish_reason="stop",
                     )
                 ],

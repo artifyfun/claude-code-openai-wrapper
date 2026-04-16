@@ -34,35 +34,44 @@ class MessageAdapter:
         return prompt, system_prompt
 
     @staticmethod
-    def filter_content(content: str) -> str:
+    def filter_content(content: str, is_stream: bool = False) -> str:
         """
         Filter content for unsupported features and tool usage.
         Remove thinking blocks, tool calls, and image references.
+        
+        If is_stream is True, it avoids aggressive stripping and fallbacks
+        that could break incremental token assembly.
         """
         if not content:
             return content
 
-        # Remove thinking blocks (common when tools are disabled but Claude tries to think)
-        thinking_pattern = r"<thinking>.*?</thinking>"
-        content = re.sub(thinking_pattern, "", content, flags=re.DOTALL)
+        # Remove thinking blocks if they are complete
+        # In stream mode, we usually get deltas, so we don't want to partial-match thinking tags
+        if not is_stream:
+            thinking_pattern = r"<thinking>.*?</thinking>"
+            content = re.sub(thinking_pattern, "", content, flags=re.DOTALL)
 
-        # Extract content from attempt_completion blocks (these contain the actual user response)
+        # Extract content from attempt_completion blocks
         attempt_completion_pattern = r"<attempt_completion>(.*?)</attempt_completion>"
         attempt_matches = re.findall(attempt_completion_pattern, content, flags=re.DOTALL)
         if attempt_matches:
             # Use the content from the attempt_completion block
-            extracted_content = attempt_matches[0].strip()
+            extracted_content = attempt_matches[0]
+            if not is_stream:
+                extracted_content = extracted_content.strip()
 
             # If there's a <result> tag inside, extract from that
             result_pattern = r"<result>(.*?)</result>"
             result_matches = re.findall(result_pattern, extracted_content, flags=re.DOTALL)
             if result_matches:
-                extracted_content = result_matches[0].strip()
+                extracted_content = result_matches[0]
+                if not is_stream:
+                    extracted_content = extracted_content.strip()
 
             if extracted_content:
                 content = extracted_content
         else:
-            # Remove other tool usage blocks (when tools are disabled but Claude tries to use them)
+            # Remove other tool usage blocks
             tool_patterns = [
                 r"<read_file>.*?</read_file>",
                 r"<write_file>.*?</write_file>",
@@ -77,8 +86,9 @@ class MessageAdapter:
                 r"<suggest>.*?</suggest>",
             ]
 
-            for pattern in tool_patterns:
-                content = re.sub(pattern, "", content, flags=re.DOTALL)
+            if not is_stream:
+                for pattern in tool_patterns:
+                    content = re.sub(pattern, "", content, flags=re.DOTALL)
 
         # Pattern to match image references or base64 data
         image_pattern = r"\[Image:.*?\]|data:image/.*?;base64,.*?(?=\s|$)"
@@ -88,13 +98,14 @@ class MessageAdapter:
 
         content = re.sub(image_pattern, replace_image, content)
 
-        # Clean up extra whitespace and newlines
-        content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)  # Multiple newlines to double
-        content = content.strip()
+        if not is_stream:
+            # Clean up extra whitespace and newlines only for non-streaming
+            content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)
+            content = content.strip()
 
-        # If content is now empty or only whitespace, provide a fallback
-        if not content or content.isspace():
-            return "I understand you're testing the system. How can I help you today?"
+            # If content is now empty or only whitespace, provide a fallback
+            if not content or content.isspace():
+                return "I understand you're testing the system. How can I help you today?"
 
         return content
 

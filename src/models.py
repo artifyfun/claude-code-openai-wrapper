@@ -26,6 +26,7 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: Union[str, List[ContentPart]]
     name: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
     @model_validator(mode="after")
     def normalize_content(self):
