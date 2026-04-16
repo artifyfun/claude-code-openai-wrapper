@@ -284,6 +284,11 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
         logger.debug(f"🔍 [{request_id}] Headers: {dict(request.headers)}")
 
         # For POST requests, try to log body (but don't break if we can't)
+        # Don't log or intercept for streaming responses or large payloads
+        content_type = request.headers.get("content-type", "").lower()
+        if "text/event-stream" in content_type:
+            return await call_next(request)
+
         body_logged = False
         if request.method == "POST" and request.url.path.startswith("/v1/"):
             try:
@@ -461,15 +466,43 @@ async def generate_streaming_response(
             # Check if we have an assistant message
             # Handle both old format (type/message structure) and new format (direct content)
             content = None
-            if chunk.get("type") == "assistant" and "message" in chunk:
+            
+            # 🆕 Handle incremental text events (crucial for true streaming)
+            # The Claude CLI with --include-partial-messages nests everything under 'event'
+            if chunk.get("type") == "stream_event" and "event" in chunk:
+                event = chunk["event"]
+                event_type = event.get("type")
+                
+                if event_type == "content_block_delta" and "delta" in chunk["event"]:
+                    delta = event["delta"]
+                    if isinstance(delta, dict):
+                        if delta.get("type") == "text_delta":
+                            content = delta.get("text", "")
+                        elif "text" in delta:
+                            content = delta.get("text", "")
+                elif event_type == "text" and "text" in event:
+                    content = event["text"]
+            
+            # Legacy/Alternative formats
+            elif chunk.get("type") == "text" and "text" in chunk:
+                content = chunk["text"]
+            elif chunk.get("type") == "delta" and "delta" in chunk:
+                content = chunk["delta"].get("text", "") if isinstance(chunk["delta"], dict) else ""
+            elif chunk.get("type") == "content_block_delta" and "delta" in chunk:
+                delta = chunk["delta"]
+                if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                    content = delta.get("text", "")
+                elif isinstance(delta, dict) and "text" in delta:
+                    content = delta.get("text", "")
+            
+            elif chunk.get("type") == "assistant" and "message" in chunk:
                 # Old format: {"type": "assistant", "message": {"content": [...]}}
                 message = chunk["message"]
                 if isinstance(message, dict) and "content" in message:
                     content = message["content"]
             elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
+                # New format: {"content": [TextBlock(...)]} (converted AssistantMessage)
                 content = chunk["content"]
-
             if content is not None:
                 # Send initial role chunk if we haven't already
                 if not role_sent:
